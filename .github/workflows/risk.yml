@@ -1,0 +1,205 @@
+# PR 위험도를 경로와 diff 크기로 분류해 risk:low|mid|high 라벨을 붙이고,
+# risk:high인데 사람이 확인하지 않은 PR은 risk-gate 체크로 막는 reusable workflow.
+# who-reviews-what의 risk-label.yml을 옮겨, 저장소마다 다른 기준을 입력으로 받게 했다.
+#
+# 분류 규칙 (가장 높은 등급이 PR 등급이 된다)
+#   high: 공통 high 경로(아래 COMMON_HIGH) + 입력 high-paths, 또는 변경 줄 수 합계(lockfile 제외)가 size-threshold 초과
+#   low : 입력 low-paths (기본 *.md)
+#   mid : 그 밖의 모든 파일
+#   한 파일이 high와 low에 모두 걸리면 high다.
+#   패턴은 bash case glob이다. `*`는 `/`도 넘으므로 `src/pay/*`는 하위 폴더까지, `*.md`는 모든 폴더의 md에 걸린다.
+#
+# 호출하는 쪽(caller) 요구 사항
+#   permissions: contents: read, pull-requests: write, statuses: write
+#   on: pull_request types [opened, synchronize, reopened, labeled, unlabeled]
+#   concurrency: PR 번호 단위 그룹 + cancel-in-progress (템플릿 참고)
+#
+# 사람 확인은 커밋 단위다 (stale review dismissal 흉내).
+#   reviewed-by-human 라벨이 붙으면 그 시점의 head 커밋에 human-review 커밋 상태(success)를 남긴다.
+#   risk-gate는 라벨과 "현재 head 커밋의 human-review 상태"를 둘 다 요구한다.
+#   새 커밋이 올라오면 새 head에는 그 상태가 없으므로, 어떤 이벤트로 시작한 실행이든 stale 라벨을 뗀다.
+name: risk
+
+on:
+  workflow_call:
+    inputs:
+      high-paths:
+        description: 이 저장소에서 사람이 꼭 봐야 하는 경로 glob (공백·줄바꿈 구분)
+        type: string
+        default: ""
+      low-paths:
+        description: 문서·문구처럼 위험이 낮은 경로 glob (공백·줄바꿈 구분)
+        type: string
+        default: "*.md"
+      size-threshold:
+        description: 변경 줄 수 합계(lockfile 제외)가 이 값을 넘으면 high
+        type: number
+        default: 400
+      enforce:
+        description: false면 risk-gate가 실패 대신 경고만 남긴다 (ruleset을 걸 수 없는 private 저장소용)
+        type: boolean
+        default: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  PR: ${{ github.event.pull_request.number }}
+  # 이 실행의 체크 결과가 붙는 커밋. 라벨을 붙인 이벤트라면 라벨을 붙인 시점의 head다.
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  # 모든 저장소에 공통인 high 경로. caller·REVIEW.md는 저장소별 기준을 담고 있어서 여기에 넣는다.
+  COMMON_HIGH: >-
+    .github/*
+    REVIEW.md
+    package.json
+    package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb
+    tsconfig*.json
+    vite.config.* next.config.* webpack.config.*
+    eslint.config.* .eslintrc*
+  LOCKFILES: package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb
+
+jobs:
+  risk-label:
+    runs-on: ubuntu-latest
+    outputs:
+      level: ${{ steps.classify.outputs.level }}
+    steps:
+      # 취소될 틈을 줄이려고 맨 앞에 둔다.
+      - name: Record human review on the labeled head commit
+        if: github.event.action == 'labeled' && github.event.label.name == 'reviewed-by-human'
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f context=human-review \
+            -f description="reviewed-by-human 라벨이 이 커밋에서 붙었다" > /dev/null
+          echo "reviewed-by-human: ${HEAD_SHA} 커밋에 human-review 상태를 남겼다." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Classify by changed paths and diff size
+        id: classify
+        env:
+          HIGH_PATHS: ${{ inputs.high-paths }}
+          LOW_PATHS: ${{ inputs.low-paths }}
+          SIZE_THRESHOLD: ${{ inputs.size-threshold }}
+        run: |
+          set -euo pipefail
+          # 패턴 목록이 runner의 파일 이름으로 확장되지 않게 한다.
+          set -f
+          rank() { case "$1" in low) echo 0 ;; mid) echo 1 ;; high) echo 2 ;; esac; }
+
+          # 공백·줄바꿈으로 구분된 패턴을 배열로 바꾼다.
+          read -ra high_patterns <<< "$(tr '\n' ' ' <<< "$COMMON_HIGH $HIGH_PATHS")"
+          read -ra low_patterns <<< "$(tr '\n' ' ' <<< "$LOW_PATHS")"
+          read -ra lockfiles <<< "$LOCKFILES"
+
+          # 경로가 패턴 목록 중 하나에 걸리는지 본다. 패턴을 따옴표 없이 써야 glob으로 동작한다.
+          matches() {
+            local path=$1; shift
+            local p
+            for p in "$@"; do
+              # shellcheck disable=SC2254
+              case "$path" in $p) return 0 ;; esac
+            done
+            return 1
+          }
+
+          level=low
+          total=0
+          reasons=""
+          while IFS=$'\t' read -r path changes; do
+            [ -z "$path" ] && continue
+            if ! matches "$path" "${lockfiles[@]}"; then
+              total=$((total + changes))
+            fi
+            if matches "$path" "${high_patterns[@]}"; then
+              file_level=high
+            elif [ "${#low_patterns[@]}" -gt 0 ] && matches "$path" "${low_patterns[@]}"; then
+              file_level=low
+            else
+              file_level=mid
+            fi
+            reasons+="| \`${path}\` | ${changes} | ${file_level} |"$'\n'
+            if [ "$(rank "$file_level")" -gt "$(rank "$level")" ]; then
+              level=$file_level
+            fi
+          done < <(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+                     --jq '.[] | [.filename, (.additions + .deletions)] | @tsv')
+
+          if [ "$total" -gt "$SIZE_THRESHOLD" ]; then
+            level=high
+          fi
+
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          {
+            echo "## risk:$level"
+            echo
+            echo "변경 줄 수 합계(lockfile 제외): $total (${SIZE_THRESHOLD} 초과 시 high)"
+            echo
+            echo "| 파일 | 변경 줄 | 등급 |"
+            echo "|---|---|---|"
+            printf '%s' "$reasons"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply risk label
+        env:
+          LEVEL: ${{ steps.classify.outputs.level }}
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name')
+
+          for other in low mid high; do
+            if [ "$other" != "$LEVEL" ] && grep -qx "risk:$other" <<< "$current"; then
+              gh api -X DELETE "repos/$REPO/issues/$PR/labels/risk%3A$other" > /dev/null
+            fi
+          done
+          if ! grep -qx "risk:$LEVEL" <<< "$current"; then
+            gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=risk:$LEVEL" > /dev/null
+          fi
+
+          # 사람 확인이 현재 head 커밋에서 이뤄지지 않았으면 라벨을 뗀다 (stale review dismissal 흉내).
+          # 이벤트 종류로 판단하지 않아야 라벨 이벤트 실행이 synchronize 실행을 취소해도 stale 라벨이 남지 않는다.
+          # 이 실행의 head가 이미 지난 커밋이면 건드리지 않는다. 새 head의 실행이 판단한다.
+          live_head=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+          if [ "$live_head" = "$HEAD_SHA" ] && grep -qx "reviewed-by-human" <<< "$current"; then
+            reviewed=$(gh api "repos/$REPO/commits/$HEAD_SHA/status" \
+                         --jq '.statuses[] | select(.context == "human-review") | .state')
+            if [ "$reviewed" != "success" ]; then
+              gh api -X DELETE "repos/$REPO/issues/$PR/labels/reviewed-by-human" > /dev/null
+              echo "reviewed-by-human 라벨이 현재 head(${HEAD_SHA})에서 붙은 것이 아니라 뗐다." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+  risk-gate:
+    needs: risk-label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require human review for risk:high
+        env:
+          LEVEL: ${{ needs.risk-label.outputs.level }}
+          ENFORCE: ${{ inputs.enforce }}
+        run: |
+          set -euo pipefail
+          if [ "$LEVEL" != "high" ]; then
+            echo "risk:$LEVEL — 사람 확인 라벨 없이 통과한다."
+            exit 0
+          fi
+          labels=$(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name')
+          reviewed=$(gh api "repos/$REPO/commits/$HEAD_SHA/status" \
+                       --jq '.statuses[] | select(.context == "human-review") | .state')
+          if grep -qx "reviewed-by-human" <<< "$labels" && [ "$reviewed" = "success" ]; then
+            echo "risk:high — reviewed-by-human 라벨이 head(${HEAD_SHA})에서 붙어 있어 통과한다."
+            exit 0
+          fi
+
+          if grep -qx "reviewed-by-human" <<< "$labels"; then
+            msg="reviewed-by-human 라벨은 있지만 head(${HEAD_SHA})에서 붙은 기록(human-review 상태)이 없다. 이 커밋까지 보고 라벨을 다시 붙여야 한다."
+          else
+            msg="risk:high PR이다. 사람이 diff를 직접 보고 reviewed-by-human 라벨을 붙여야 병합할 수 있다."
+          fi
+
+          # private 저장소처럼 ruleset으로 막을 수 없는 곳에서는 빨간 체크 대신 경고만 남긴다.
+          if [ "$ENFORCE" != "true" ]; then
+            echo "::warning::$msg (enforce: false라 막지 않는다)"
+            exit 0
+          fi
+          echo "::error::$msg"
+          exit 1
