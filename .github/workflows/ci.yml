@@ -1,0 +1,76 @@
+# 저장소가 정한 검증 명령(lint·typecheck·test·build 등)을 돌리는 reusable workflow.
+# 어떤 명령을 돌릴지, 어떤 패키지 매니저·Node 버전을 쓸지는 caller가 입력으로 정한다.
+#
+# 호출하는 쪽(caller) 요구 사항
+#   permissions: contents: read
+#
+# 캐시는 npm만 쓴다. pnpm·yarn은 setup-node 캐시 전에 매니저가 설치돼 있어야 해서 순서가 꼬이므로 생략했다.
+name: ci
+
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: npm | pnpm | yarn | bun
+        type: string
+        default: npm
+      node-version:
+        description: Node 버전 (예 22, 20.11)
+        type: string
+        default: "22"
+      commands:
+        description: package.json의 script 이름, 줄마다 하나씩. 적힌 순서대로 돈다
+        type: string
+        required: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PM: ${{ inputs.package-manager }}
+      COMMANDS: ${{ inputs.commands }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager == 'npm' && 'npm' || '' }}
+
+      - if: inputs.package-manager == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      # pnpm·yarn은 package.json의 packageManager 필드에 적힌 버전을 corepack이 맞춰 준다.
+      - if: inputs.package-manager == 'pnpm' || inputs.package-manager == 'yarn'
+        run: corepack enable
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            npm)  npm ci ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            # yarn berry(.yarnrc.yml 있음)와 v1의 잠금 옵션 이름이 다르다.
+            yarn) if [ -f .yarnrc.yml ]; then yarn install --immutable; else yarn install --frozen-lockfile; fi ;;
+            bun)  bun install --frozen-lockfile ;;
+            *)    echo "::error::지원하지 않는 package-manager: $PM"; exit 1 ;;
+          esac
+
+      - name: Run commands
+        run: |
+          set -euo pipefail
+          ran=0
+          while IFS= read -r script; do
+            # 앞뒤 공백과 빈 줄은 건너뛴다.
+            script=$(echo "$script" | xargs)
+            [ -z "$script" ] && continue
+            echo "::group::$PM run $script"
+            "$PM" run "$script"
+            echo "::endgroup::"
+            ran=$((ran + 1))
+          done <<< "$COMMANDS"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::commands 입력이 비어 있다."
+            exit 1
+          fi

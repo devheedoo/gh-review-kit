@@ -81,7 +81,7 @@ who-reviews-what에서 만든 리뷰 흐름(CI 게이트, 위험도 분류, 사�
 `@v1` 태그는 7단계 caller가 참조해야 하므로 4단계 뒤에 먼저 붙이고, 7단계에서 고칠 것이 생기면 옮긴다. 대상 저장소의 변경은 설정 PR 하나로 revert할 수 있고, ruleset은 `protect`가 출력한 id로 삭제한다.
 
 - [x] 1. `gh-review-kit` 저장소 생성 + reusable `risk.yml` — who-reviews-what의 `risk-label.yml`을 옮기고 `high-paths`·`low-paths`·`size-threshold`·`enforce` 입력과 공통 high 경로(lockfile 종류별)를 추가 — 권장 모델: Opus 5.5 (분류·게이트 경계와 라벨 경합 처리를 그대로 옮겨야 함)
-- [ ] 2. reusable `ci.yml` — `package-manager`·`node-version`·`commands` 입력, 매니저별 설치 명령과 캐시 — 권장 모델: Sonnet 5.5 (명세가 정해진 워크플로)
+- [x] 2. reusable `ci.yml` — `package-manager`·`node-version`·`commands` 입력, 매니저별 설치 명령과 캐시 — 권장 모델: Sonnet 5.5 (명세가 정해진 워크플로)
 - [ ] 3. 템플릿 — caller 2개, `REVIEW.md`(공통 블록 + 저장소별 `TODO`) — 권장 모델: Sonnet 5.5 Medium (기존 문서에서 옮기는 작업)
 - [ ] 4. 스크립트 `init` / `protect` — 감지 → 파일 생성(기존 파일 건너뜀) → 라벨 생성 → 브랜치·PR / 공개 저장소에만 ruleset 적용, `--dry-run` 지원, 다시 실행해도 결과가 같게 — 권장 모델: Opus 5.5 (감지 분기와 순서 제약이 많음)
 - [ ] 5. `devheedoo/.github` 저장소에 기본 PR 템플릿 — 권장 모델: Haiku 5.5 (파일 하나 복사)
