@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# gh review-kit — CI 게이트·위험도 분류·REVIEW.md 리뷰 흐름을 저장소에 적용한다.
+#
+#   gh review-kit init <owner/repo> [--pm npm|pnpm|yarn|bun] [--dry-run]
+#   gh review-kit protect <owner/repo> [--dry-run]
+#
+# macOS 기본 bash(3.2)에서도 돌도록 mapfile·연관 배열을 쓰지 않는다.
+set -euo pipefail
+
+KIT_DIR=$(cd "$(dirname "$0")" && pwd)
+TEMPLATES="$KIT_DIR/templates"
+BRANCH="review-kit/init"
+RULESET_NAME="review-kit"
+# required status check의 출처를 GitHub Actions 앱으로 고정한다. 같은 이름의 상태를 다른 토큰이 흉내 내지 못하게 한다.
+ACTIONS_APP_ID=15368
+CI_CHECK="review-kit-ci / ci"
+RISK_CHECK="review-kit-risk / risk-gate"
+
+usage() {
+  cat <<'EOF'
+사용법
+  gh review-kit init <owner/repo> [--pm npm|pnpm|yarn|bun] [--dry-run]
+      감지한 값으로 caller workflow 2개와 REVIEW.md를 만들고, 라벨을 만든 뒤 설정 PR을 연다.
+      이미 있는 파일은 덮어쓰지 않는다.
+  gh review-kit protect <owner/repo> [--dry-run]
+      설정 PR이 병합된 뒤 기본 브랜치에 ruleset을 건다. public 저장소에만 적용한다.
+EOF
+}
+
+die() { echo "오류: $*" >&2; exit 1; }
+info() { echo "• $*"; }
+warn() { echo "! $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# 저장소 정보: 공개 여부·보관 여부·기본 브랜치·내 권한을 전역 변수로 읽어 둔다.
+# ---------------------------------------------------------------------------
+repo_meta() {
+  local json
+  json=$(gh repo view "$1" --json nameWithOwner,visibility,isArchived,defaultBranchRef,viewerPermission) \
+    || die "$1 저장소를 읽을 수 없다."
+  REPO=$(jq -r .nameWithOwner <<< "$json")
+  VISIBILITY=$(jq -r .visibility <<< "$json")
+  ARCHIVED=$(jq -r .isArchived <<< "$json")
+  DEFAULT_BRANCH=$(jq -r '.defaultBranchRef.name // empty' <<< "$json")
+  PERMISSION=$(jq -r .viewerPermission <<< "$json")
+  [ "$ARCHIVED" = "true" ] && die "$REPO는 보관(archived)된 저장소다."
+  [ -n "$DEFAULT_BRANCH" ] || die "$REPO에 기본 브랜치가 없다 (커밋이 없는 저장소)."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 감지: lockfile로 패키지 매니저, 버전 파일로 Node 버전, package.json으로 검증 명령을 정한다.
+# ---------------------------------------------------------------------------
+detect_pm() {
+  local dir=$1 found=""
+  [ -f "$dir/package-lock.json" ] || [ -f "$dir/npm-shrinkwrap.json" ] && found="$found npm"
+  [ -f "$dir/pnpm-lock.yaml" ] && found="$found pnpm"
+  [ -f "$dir/yarn.lock" ] && found="$found yarn"
+  [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ] && found="$found bun"
+  found=$(echo "$found" | xargs)
+  case "$found" in
+    "") die "lockfile이 없다. lockfile을 커밋하거나 --pm으로 매니저를 지정한다." ;;
+    *" "*) die "lockfile이 여럿이다 ($found). --pm으로 매니저를 지정한다." ;;
+    *) echo "$found" ;;
+  esac
+}
+
+# 버전 문자열이 "22", "20.11", "v18.19.0"처럼 정확한 숫자면 v를 떼서 돌려준다. 아니면 빈 값.
+exact_version() {
+  local v
+  v=$(echo "$1" | xargs)
+  v=${v#v}
+  if [[ "$v" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then echo "$v"; fi
+}
+
+detect_node() {
+  local dir=$1 raw="" source="" v=""
+  if [ -f "$dir/.nvmrc" ]; then
+    raw=$(head -n 1 "$dir/.nvmrc"); source=".nvmrc"
+  elif [ -f "$dir/.node-version" ]; then
+    raw=$(head -n 1 "$dir/.node-version"); source=".node-version"
+  else
+    raw=$(jq -r '.engines.node // empty' "$dir/package.json"); source="engines.node"
+  fi
+  if [ -z "$raw" ]; then echo 22; return; fi
+  v=$(exact_version "$raw")
+  if [ -z "$v" ]; then
+    warn "$source 값 '$raw'은 정확한 버전이 아니라 Node 22를 쓴다. 설정 PR에서 확인한다."
+    echo 22
+  else
+    echo "$v"
+  fi
+}
+
+# lint → typecheck(type-check) → test → build 순으로, package.json에 있는 script만 고른다.
+detect_commands() {
+  local pkg=$1/package.json scripts out="" s body
+  scripts=$(jq -r '.scripts // {} | keys[]' "$pkg")
+  has() { grep -qx "$1" <<< "$scripts"; }
+  has lint && out="$out lint"
+  if has typecheck; then out="$out typecheck"; elif has type-check; then out="$out type-check"; fi
+  if has test; then
+    body=$(jq -r '.scripts.test' "$pkg")
+    case "$body" in
+      *"no test specified"*) warn "test script가 npm init 기본값이라 넣지 않는다." ;;
+      *--watch*|*" watch"*) warn "test script가 watch 모드라 넣지 않는다: $body"; ;;
+      *) out="$out test" ;;
+    esac
+  fi
+  has build && out="$out build"
+  for s in $out; do echo "$s"; done
+}
+
+# 템플릿의 __이름__ 자리를 값으로 바꾼다. 인자는 "이름=값" 쌍.
+render() {
+  local tpl pair key val
+  tpl=$(cat "$1"); shift
+  for pair in "$@"; do
+    key=${pair%%=*}; val=${pair#*=}
+    tpl=${tpl//__${key}__/$val}
+  done
+  printf '%s\n' "$tpl"
+}
+
+# ---------------------------------------------------------------------------
+# 라벨: risk 등급 3개와 사람 확인 라벨. 이미 있으면 색·설명만 맞춘다.
+# ---------------------------------------------------------------------------
+ensure_labels() {
+  local repo=$1
+  gh label create "risk:low" -R "$repo" --force --color 2da44e --description "문서·문구만 바뀜. 사람 확인 없이 병합" > /dev/null
+  gh label create "risk:mid" -R "$repo" --force --color d4a72c --description "일반 코드 변경" > /dev/null
+  gh label create "risk:high" -R "$repo" --force --color cf222e --description "CI·설정·의존성·민감 경로 또는 대형 diff. 사람 확인 필요" > /dev/null
+  gh label create "reviewed-by-human" -R "$repo" --force --color 0969da --description "사람이 이 커밋까지 diff를 직접 봤다. risk:high의 risk-gate를 통과시킨다" > /dev/null
+  info "라벨 4개를 맞췄다."
+}
+
+# ---------------------------------------------------------------------------
+# init: 감지 → 파일 생성(기존 파일 건너뜀) → 라벨 → 브랜치·PR
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local target="" pm_override="" dry_run=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pm) pm_override=${2:-}; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "알 수 없는 옵션: $1" ;;
+      *) target=$1; shift ;;
+    esac
+  done
+  [ -n "$target" ] || { usage; exit 1; }
+  case "$pm_override" in ""|npm|pnpm|yarn|bun) ;; *) die "--pm은 npm|pnpm|yarn|bun 중 하나다." ;; esac
+
+  repo_meta "$target"
+  case "$PERMISSION" in ADMIN|MAINTAIN|WRITE) ;; *) die "$REPO에 쓰기 권한이 없다 ($PERMISSION)." ;; esac
+
+  # trap은 함수가 끝난 뒤 실행되므로 임시 폴더 경로는 전역 변수에 둔다.
+  local dir
+  TMP_DIR=$(mktemp -d)
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  dir="$TMP_DIR/repo"
+  gh repo clone "$REPO" "$dir" -- --depth 1 --quiet
+
+  # 저장소별 값 감지. package.json이 없으면 CI caller는 만들지 않는다.
+  local pm="" node="" commands="" enforce=false make_ci=1
+  [ "$VISIBILITY" = "PUBLIC" ] && enforce=true
+  if [ -f "$dir/package.json" ]; then
+    if [ -n "$pm_override" ]; then pm=$pm_override; else pm=$(detect_pm "$dir"); fi
+    node=$(detect_node "$dir")
+    commands=$(detect_commands "$dir")
+    if [ -z "$commands" ]; then
+      warn "lint·typecheck·test·build script가 없어 CI caller를 만들지 않는다."
+      make_ci=0
+    fi
+  else
+    warn "package.json이 없어 CI caller를 만들지 않는다. 위험도 분류만 적용한다."
+    make_ci=0
+  fi
+
+  echo "저장소: $REPO ($VISIBILITY, 기본 브랜치 $DEFAULT_BRANCH)"
+  if [ "$make_ci" = 1 ]; then
+    echo "  package-manager: $pm"
+    echo "  node-version:    $node"
+    echo "  commands:        $(echo $commands)"
+  fi
+  echo "  enforce:         $enforce"
+
+  # 만들 파일 목록. 이미 있으면 건너뛴다.
+  local ci_path=".github/workflows/review-kit-ci.yml"
+  local risk_path=".github/workflows/review-kit-risk.yml"
+  local created="" skipped=""
+  local f
+  if [ "$make_ci" = 1 ]; then
+    if [ -e "$dir/$ci_path" ]; then skipped="$skipped $ci_path"; else
+      local cmd_lines
+      # caller 템플릿의 commands 블록 들여쓰기(8칸)에 맞춰 줄을 잇는다.
+      cmd_lines=$(echo "$commands" | sed '2,$s/^/        /')
+      mkdir -p "$dir/.github/workflows"
+      render "$TEMPLATES/review-kit-ci.yml" \
+        "DEFAULT_BRANCH=$DEFAULT_BRANCH" "PACKAGE_MANAGER=$pm" "NODE_VERSION=$node" "COMMANDS=$cmd_lines" \
+        > "$dir/$ci_path"
+      created="$created $ci_path"
+    fi
+  fi
+  if [ -e "$dir/$risk_path" ]; then skipped="$skipped $risk_path"; else
+    mkdir -p "$dir/.github/workflows"
+    render "$TEMPLATES/review-kit-risk.yml" "ENFORCE=$enforce" > "$dir/$risk_path"
+    created="$created $risk_path"
+  fi
+  if [ -e "$dir/REVIEW.md" ]; then skipped="$skipped REVIEW.md"; else
+    cp "$TEMPLATES/REVIEW.md" "$dir/REVIEW.md"
+    created="$created REVIEW.md"
+  fi
+  [ -n "$skipped" ] && warn "이미 있어 건너뛴 파일:$skipped"
+
+  if [ "$dry_run" = 1 ]; then
+    for f in $created; do
+      echo; echo "----- $f"; cat "$dir/$f"
+    done
+    echo; info "--dry-run: 라벨·브랜치·PR을 만들지 않았다."
+    return 0
+  fi
+
+  ensure_labels "$REPO"
+  if [ -z "$created" ]; then
+    info "새로 넣을 파일이 없다. 라벨만 맞췄다."
+    return 0
+  fi
+
+  # 설정 PR. 같은 이름의 원격 브랜치가 있으면 이전 실행의 PR이 남아 있는 것이라 멈춘다.
+  if git -C "$dir" ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+    die "원격에 $BRANCH 브랜치가 이미 있다. 이전 설정 PR을 정리한 뒤 다시 실행한다."
+  fi
+  git -C "$dir" checkout -q -b "$BRANCH"
+  # shellcheck disable=SC2086
+  git -C "$dir" add $created
+  git -C "$dir" commit -q -F - <<EOF
+chore: review-kit 리뷰 흐름 적용
+
+- 추가:$(for f in $created; do printf '\n  - %s' "$f"; done)
+- 감지 값: package-manager ${pm:-없음}, node ${node:-없음}, enforce ${enforce}
+EOF
+  git -C "$dir" push -q -u origin "$BRANCH"
+
+  local body skipped_line=""
+  if [ -n "$skipped" ]; then
+    skipped_line="이미 있어 건너뛴 파일:$(for f in $skipped; do printf ' `%s`' "$f"; done)"
+  fi
+  body=$(cat <<EOF
+## 동료 리뷰용
+
+- devheedoo/gh-review-kit의 리뷰 흐름(CI 게이트, 위험도 라벨, 사람 확인 게이트, REVIEW.md 태그 규칙)을 적용한다.
+- **병합 전에 채울 것**: \`review-kit-risk.yml\`의 \`high-paths\`, \`REVIEW.md\`의 "이 저장소" 절.
+- \`.github/\` 경로라 이 PR 자체가 risk:high다. diff를 보고 \`reviewed-by-human\` 라벨을 붙인다.
+
+---
+
+## 무엇을 바꿨나
+
+$(for f in $created; do echo "- \`$f\`"; done)
+
+감지한 값: package-manager \`${pm:-없음}\`, node-version \`${node:-없음}\`, commands \`$(echo $commands)\`, enforce \`${enforce}\`
+
+${skipped_line}
+
+## 어떻게 확인했나
+
+- [ ] \`review-kit-ci / ci\` 체크가 통과한다
+- [ ] \`review-kit-risk / risk-label\`이 이 PR에 \`risk:high\`를 붙였다
+- [ ] \`high-paths\`·\`low-paths\`를 이 저장소에 맞게 채웠다
+- [ ] \`REVIEW.md\`의 "이 저장소에서 특히 볼 것"을 채웠다
+
+## 위험도
+
+새 체크가 생길 뿐 기존 workflow는 건드리지 않는다. 병합 뒤 \`gh review-kit protect $REPO\`를 실행하면 기본 브랜치에 ruleset이 걸린다 (public 저장소만).
+
+## 어떻게 되돌리나
+
+이 PR을 revert하면 된다. \`protect\`를 실행했다면 ruleset도 지운다 (\`protect\`가 출력한 명령).
+EOF
+)
+  gh pr create -R "$REPO" --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+    --title "chore: review-kit 리뷰 흐름 적용" --body "$body"
+  echo
+  info "다음 단계: PR에서 high-paths·REVIEW.md를 채워 병합한 뒤 'gh review-kit protect $REPO'"
+}
+
+# ---------------------------------------------------------------------------
+# protect: 기본 브랜치에 ruleset을 건다. 설정 PR이 병합돼 체크가 존재할 때만.
+# ---------------------------------------------------------------------------
+cmd_protect() {
+  local target="" dry_run=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "알 수 없는 옵션: $1" ;;
+      *) target=$1; shift ;;
+    esac
+  done
+  [ -n "$target" ] || { usage; exit 1; }
+
+  repo_meta "$target"
+  if [ "$VISIBILITY" != "PUBLIC" ]; then
+    info "$REPO는 $VISIBILITY 저장소라 ruleset을 걸지 않는다 (GitHub Free는 private 저장소에 ruleset을 지원하지 않는다)."
+    info "risk-gate는 enforce: false로 경고만 남긴다."
+    return 0
+  fi
+  [ "$PERMISSION" = "ADMIN" ] || die "ruleset을 걸려면 $REPO의 admin 권한이 필요하다 ($PERMISSION)."
+
+  # ruleset을 먼저 걸면 아직 없는 체크를 기다리느라 설정 PR이 막힌다. 기본 브랜치에 caller가 있는지 본다.
+  has_file() { gh api "repos/$REPO/contents/$1?ref=$DEFAULT_BRANCH" --silent > /dev/null 2>&1; }
+  has_file ".github/workflows/review-kit-risk.yml" \
+    || die "$DEFAULT_BRANCH에 review-kit-risk.yml이 없다. 설정 PR을 먼저 병합한다."
+  local checks
+  checks=$(jq -n --arg c "$RISK_CHECK" --argjson app "$ACTIONS_APP_ID" '[{context: $c, integration_id: $app}]')
+  if has_file ".github/workflows/review-kit-ci.yml"; then
+    checks=$(jq --arg c "$CI_CHECK" --argjson app "$ACTIONS_APP_ID" '. + [{context: $c, integration_id: $app}]' <<< "$checks")
+  else
+    warn "review-kit-ci.yml이 없어 CI 체크는 요구하지 않는다."
+  fi
+
+  # who-reviews-what의 "main 보호"와 같은 규칙: PR 필수(승인 0), 스레드 resolve, 체크 통과, 삭제·force push 금지.
+  local payload
+  payload=$(jq -n --arg name "$RULESET_NAME" --argjson checks "$checks" '{
+    name: $name,
+    target: "branch",
+    enforcement: "active",
+    conditions: {ref_name: {include: ["~DEFAULT_BRANCH"], exclude: []}},
+    rules: [
+      {type: "deletion"},
+      {type: "non_fast_forward"},
+      {type: "pull_request", parameters: {
+        required_approving_review_count: 0,
+        dismiss_stale_reviews_on_push: false,
+        require_code_owner_review: false,
+        require_last_push_approval: false,
+        required_review_thread_resolution: true}},
+      {type: "required_status_checks", parameters: {
+        strict_required_status_checks_policy: false,
+        required_status_checks: $checks}}
+    ]}')
+
+  local existing
+  existing=$(gh api "repos/$REPO/rulesets" --jq ".[] | select(.name == \"$RULESET_NAME\") | .id" | head -n 1)
+  if [ "$dry_run" = 1 ]; then
+    echo "$payload"
+    info "--dry-run: ${existing:+기존 ruleset $existing을 }$([ -n "$existing" ] && echo 갱신 || echo 생성)하지 않았다."
+    return 0
+  fi
+
+  local id
+  if [ -n "$existing" ]; then
+    id=$(gh api -X PUT "repos/$REPO/rulesets/$existing" --input - --jq .id <<< "$payload")
+    info "ruleset '$RULESET_NAME'($id)를 갱신했다."
+  else
+    id=$(gh api -X POST "repos/$REPO/rulesets" --input - --jq .id <<< "$payload")
+    info "ruleset '$RULESET_NAME'($id)를 만들었다."
+  fi
+  info "필수 체크: $(jq -r '[.[].context] | join(", ")' <<< "$checks")"
+  info "되돌리기: gh api -X DELETE repos/$REPO/rulesets/$id"
+}
+
+main() {
+  command -v jq > /dev/null || die "jq가 필요하다."
+  local sub=${1:-}
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    init) cmd_init "$@" ;;
+    protect) cmd_protect "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
