@@ -84,9 +84,9 @@ who-reviews-what에서 만든 리뷰 흐름(CI 게이트, 위험도 분류, 사�
 - [x] 2. reusable `ci.yml` — `package-manager`·`node-version`·`commands` 입력, 매니저별 설치 명령과 캐시 — 권장 모델: Sonnet 5.5 (명세가 정해진 워크플로)
 - [x] 3. 템플릿 — caller 2개, `REVIEW.md`(공통 블록 + 저장소별 `TODO`) — 권장 모델: Sonnet 5.5 Medium (기존 문서에서 옮기는 작업)
 - [x] 4. 스크립트 `init` / `protect` — 감지 → 파일 생성(기존 파일 건너뜀) → 라벨 생성 → 브랜치·PR / 공개 저장소에만 ruleset 적용, `--dry-run` 지원, 다시 실행해도 결과가 같게 — 권장 모델: Opus 5.5 (감지 분기와 순서 제약이 많음)
-- [ ] 5. `devheedoo/.github` 저장소에 기본 PR 템플릿 — 권장 모델: Haiku 5.5 (파일 하나 복사)
-- [ ] 6. `~/.claude/CLAUDE.md`에 자체 검증·REVIEW.md 절 추가 — 권장 모델: Sonnet 5.5 Medium (문서 한 절)
-- [ ] 7. 시범 적용 — 테스트 저장소에 `init` → 설정 PR 병합 → `protect` → low·mid·high PR로 라벨·게이트·`reviewed-by-human` 흐름 확인 → `@v1` 태그 — 권장 모델: Opus 5.5 (실제 GitHub 동작 검증)
+- [x] 5. `devheedoo/.github` 저장소에 기본 PR 템플릿 — 권장 모델: Haiku 5.5 (파일 하나 복사)
+- [x] 6. `~/.claude/CLAUDE.md`에 자체 검증·REVIEW.md 절 추가 — 권장 모델: Sonnet 5.5 Medium (문서 한 절)
+- [x] 7. 시범 적용 — 테스트 저장소에 `init` → 설정 PR 병합 → `protect` → low·mid·high PR로 라벨·게이트·`reviewed-by-human` 흐름 확인 → `@v1` 태그 — 권장 모델: Opus 5.5 (실제 GitHub 동작 검증)
 
 ## 처리할 엣지 케이스
 
@@ -103,3 +103,14 @@ who-reviews-what에서 만든 리뷰 흐름(CI 게이트, 위험도 분류, 사�
 
 - PR이 caller 파일을 고쳐 다른 workflow를 부르게 하면 게이트를 피할 수 있다. caller는 high 경로라 사람 확인 라벨이 필요하지만, 그 판정 자체도 PR 브랜치의 caller로 돈다. 완전히 막으려면 org의 required workflow가 필요하고, 개인 계정에는 없다.
 - 승인 수(0/1/2명)는 who-reviews-what과 같이 `reviewed-by-human` 라벨 하나로 대신한다.
+
+## 시범 적용 결과 (2026-11-19, devheedoo/review-kit-sandbox)
+
+- 체크 이름: `review-kit-ci / ci`, `review-kit-risk / risk-label`, `review-kit-risk / risk-gate` — ruleset 요구 이름과 일치
+- 설정 PR(#1): risk:high → `risk-gate` 실패 → `reviewed-by-human` 라벨 후 통과 → 병합 → `protect`로 ruleset 생성
+- `protect` 다시 실행: 같은 이름 ruleset을 갱신 (중복 생성 없음)
+- main 직접 push: `GH013 Repository rule violations`로 거부
+- README만(#2) risk:low CLEAN / `src/index.js`(#3) risk:mid CLEAN / `src/pay.js`(#4, high-paths) risk:high BLOCKED
+- #4에 라벨 → CLEAN, 새 커밋 push → 라벨 자동 제거·`risk-gate` 실패·BLOCKED
+- 계정 기본 PR 템플릿(`devheedoo/.github`)이 템플릿 없는 저장소의 PR 작성 화면에 채워짐
+- 확인 못 한 것: pnpm·yarn·bun 저장소의 CI 설치 경로, private 저장소의 `enforce: false` 경고 동작
